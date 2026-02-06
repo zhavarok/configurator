@@ -11,6 +11,7 @@ import sys
 import shutil
 import tempfile
 import logging
+import re
 
 logging.basicConfig(filename='configurator.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -171,6 +172,65 @@ class AttendanceSystemConfigurator:
             return
 
         def flash():
+            class RealTimeOutput:
+                def __init__(self, window, p_bar, p_label, out_stream):
+                    self.window = window
+                    self.p_bar = p_bar
+                    self.p_label = p_label
+                    self.out_stream = out_stream
+                    self.buffer = ""
+                    self.full_log = []
+
+                def write(self, string):
+                    # Дублируем вывод в консоль PyCharm
+                    if self.out_stream:
+                        self.out_stream.write(string)
+                        self.out_stream.flush()
+
+                    if not string: return
+                    self.full_log.append(string)
+                    self.buffer += string
+
+                    # Оставляем последние 100 символов для анализа
+                    if len(self.buffer) > 100:
+                        self.buffer = self.buffer[-100:]
+
+                    # Ищем проценты в буфере.
+                    # Паттерн: число (возможно с точкой), за которым следует %
+                    # Примеры: 10%, 10.5%, 10 %, (10 %)
+                    matches = re.findall(r'(\d{1,3})(?:\.\d+)?\s?%', self.buffer)
+                    if matches:
+                        try:
+                            percent = int(matches[-1])
+                            self.window.after(0, self.update_ui, percent)
+                        except ValueError:
+                            pass
+
+                def update_ui(self, percent):
+                    self.p_bar['value'] = percent
+                    self.p_label['text'] = f"{percent}%"
+                    self.window.update_idletasks()
+
+                def flush(self):
+                    if self.out_stream:
+                        self.out_stream.flush()
+
+                def isatty(self):
+                    return True
+
+                def getvalue(self):
+                    return "".join(self.full_log)
+
+            # Сохраняем оригинальные stdout/stderr
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+
+            # Создаем перехватчик, передавая ему оригинальный stdout для вывода в консоль
+            real_time_out = RealTimeOutput(self.window, self.progress_bar, self.percent_label, original_stdout)
+
+            sys.stdout = real_time_out
+            sys.stderr = real_time_out
+
             try:
                 # Путь к run_esptool.py
                 if getattr(sys, 'frozen', False):
@@ -181,6 +241,8 @@ class AttendanceSystemConfigurator:
                 logging.debug(f"Путь к run_esptool.py: {esptool_path}")
                 if not os.path.exists(esptool_path):
                     logging.error(f"Файл run_esptool.py не найден: {esptool_path}")
+                    sys.stdout = original_stdout
+                    sys.stderr = original_stderr
                     messagebox.showerror("Ошибка", f"Файл run_esptool.py не найден: {esptool_path}")
                     return
 
@@ -195,49 +257,40 @@ class AttendanceSystemConfigurator:
                 # Запускаем esptool напрямую через модуль
                 import run_esptool
                 sys.argv = ['esptool'] + args  # Устанавливаем аргументы для esptool
-                output = []
                 success = False
 
-                # Перенаправляем stdout и stderr для захвата вывода
-                import io
-                from contextlib import redirect_stdout, redirect_stderr
-                stdout_capture = io.StringIO()
-                stderr_capture = io.StringIO()
-                with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                    try:
-                        run_esptool.main()
-                        success = True
-                    except SystemExit:
-                        pass  # esptool вызывает sys.exit(), игнорируем
-                    except Exception as e:
-                        logging.error(f"Исключение в run_esptool: {str(e)}")
-                        output.append(f"Исключение в esptool: {str(e)}")
+                try:
+                    run_esptool.main()
+                    success = True
+                except SystemExit:
+                    pass  # esptool вызывает sys.exit(), игнорируем
+                except Exception as e:
+                    logging.error(f"Исключение в run_esptool: {str(e)}")
+                    real_time_out.write(f"Исключение в esptool: {str(e)}")
 
-                stdout = stdout_capture.getvalue()
-                stderr = stderr_capture.getvalue()
-                output.extend([stdout, stderr])
-                output_str = '\n'.join(filter(None, output))
-                logging.debug(f"esptool stdout: {stdout}")
-                logging.debug(f"esptool stderr: {stderr}")
+                output_str = real_time_out.getvalue()
+
+                # Восстанавливаем вывод
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
 
                 # Проверяем, была ли прошивка успешной
-                if success and "Hash of data verified" in stdout:
-                    for line in stdout.splitlines():
-                        if '(' in line and '%' in line:
-                            percent = line.strip().split('(')[-1].split(' ')[0]
-                            if percent.isdigit():
-                                self.percent_label['text'] = f"{percent}%"
-                                self.progress_bar['value'] = int(percent)
-                                self.window.update_idletasks()
+                if success and "Hash of data verified" in output_str:
+                    self.window.after(0, lambda: self.progress_bar.configure(value=100))
+                    self.window.after(0, lambda: self.percent_label.configure(text="100%"))
                     messagebox.showinfo("Успех", "Прошивка завершена успешно!")
                     logging.debug("Прошивка успешно завершена")
                 else:
-                    logging.error(f"Ошибка прошивки:\nstdout: {stdout}\nstderr: {stderr}")
+                    logging.error(f"Ошибка прошивки:\n{output_str}")
                     messagebox.showerror("Ошибка", f"Прошивка завершилась с ошибкой:\n{output_str or 'Нет вывода от esptool'}")
             except Exception as e:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
                 logging.error(f"Исключение при прошивке: {str(e)}")
                 messagebox.showerror("Ошибка", f"Произошла ошибка: {str(e)}")
             finally:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
                 # Удаляем временный файл
                 if os.path.exists(temp_firmware_path):
                     try:

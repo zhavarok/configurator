@@ -11,6 +11,7 @@ import sys
 import shutil
 import tempfile
 import logging
+import re
 
 logging.basicConfig(filename='configurator.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -184,96 +185,123 @@ class TemperatureSensorConfigurator:
 
         if not port:
             messagebox.showerror("Ошибка", "Выберите COM-порт для прошивки.")
-            logging.error("COM-порт не выбран")
             return
         if not firmware_file or not os.path.exists(firmware_file):
             messagebox.showerror("Ошибка", f"Файл прошивки не найден: {firmware_file}.")
-            logging.error(f"Файл прошивки не существует: {firmware_file}")
-            return
-        if not os.access(firmware_file, os.R_OK):
-            messagebox.showerror("Ошибка", f"Файл прошивки недоступен для чтения: {firmware_file}.")
-            logging.error(f"Файл прошивки недоступен: {firmware_file}")
             return
 
         temp_dir = tempfile.gettempdir()
         temp_firmware_path = os.path.join(temp_dir, os.path.basename(firmware_file))
         try:
             shutil.copy(firmware_file, temp_firmware_path)
-            logging.debug(f"Файл прошивки скопирован во временную папку: {temp_firmware_path}")
         except Exception as e:
-            logging.error(f"Ошибка копирования файла прошивки: {str(e)}")
             messagebox.showerror("Ошибка", f"Не удалось скопировать файл прошивки: {str(e)}")
             return
 
         def flash():
+            class RealTimeOutput:
+                def __init__(self, window, p_bar, p_label, out_stream):
+                    self.window = window
+                    self.p_bar = p_bar
+                    self.p_label = p_label
+                    self.out_stream = out_stream
+                    self.buffer = ""
+                    self.full_log = []
+
+                def write(self, string):
+                    # Дублируем вывод в консоль PyCharm
+                    if self.out_stream:
+                        self.out_stream.write(string)
+                        self.out_stream.flush()
+
+                    if not string: return
+                    self.full_log.append(string)
+                    self.buffer += string
+                    
+                    # Оставляем последние 100 символов для анализа
+                    if len(self.buffer) > 100:
+                        self.buffer = self.buffer[-100:]
+
+                    # Ищем проценты в буфере. 
+                    # Паттерн: число (возможно с точкой), за которым следует %
+                    # Примеры: 10%, 10.5%, 10 %, (10 %)
+                    matches = re.findall(r'(\d{1,3})(?:\.\d+)?\s?%', self.buffer)
+                    if matches:
+                        try:
+                            percent = int(matches[-1])
+                            self.window.after(0, self.update_ui, percent)
+                        except ValueError:
+                            pass
+
+                def update_ui(self, percent):
+                    self.p_bar['value'] = percent
+                    self.p_label['text'] = f"{percent}%"
+                    self.window.update_idletasks()
+
+                def flush(self):
+                    if self.out_stream:
+                        self.out_stream.flush()
+                
+                def isatty(self):
+                    return True
+                
+                def getvalue(self):
+                    return "".join(self.full_log)
+
+            # Сохраняем оригинальные stdout/stderr
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            
+            # Создаем перехватчик, передавая ему оригинальный stdout для вывода в консоль
+            real_time_out = RealTimeOutput(self.window, progress_bar, percent_label, original_stdout)
+            
+            sys.stdout = real_time_out
+            sys.stderr = real_time_out
+
             try:
                 if getattr(sys, 'frozen', False):
                     esptool_path = os.path.join(sys._MEIPASS, 'run_esptool.py')
                 else:
                     esptool_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'run_esptool.py')
 
-                logging.debug(f"Путь к run_esptool.py: {esptool_path}")
-                if not os.path.exists(esptool_path):
-                    logging.error(f"Файл run_esptool.py не найден: {esptool_path}")
-                    messagebox.showerror("Ошибка", f"Файл run_esptool.py не найден: {esptool_path}")
-                    return
-
                 args = [
                     "--chip", "esp32", "--port", port, "--baud", "921600", "--before", "default_reset",
                     "--after", "hard_reset", "write_flash", "--flash_mode", "dio", "--flash_freq", "80m",
                     "--flash_size", "4MB", "0x10000", temp_firmware_path
                 ]
-                logging.debug(f"Аргументы esptool: {args}")
-
+                
                 import run_esptool
                 sys.argv = ['esptool'] + args
-                output = []
                 success = False
 
-                import io
-                from contextlib import redirect_stdout, redirect_stderr
-                stdout_capture = io.StringIO()
-                stderr_capture = io.StringIO()
-                with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                    try:
-                        run_esptool.main()
-                        success = True
-                    except SystemExit:
-                        pass
-                    except Exception as e:
-                        logging.error(f"Исключение в run_esptool: {str(e)}")
-                        output.append(f"Исключение в esptool: {str(e)}")
+                try:
+                    run_esptool.main()
+                    success = True
+                except SystemExit: pass
+                except Exception as e: logging.error(f"Исключение в run_esptool: {str(e)}")
 
-                stdout = stdout_capture.getvalue()
-                stderr = stderr_capture.getvalue()
-                output.extend([stdout, stderr])
-                output_str = '\n'.join(filter(None, output))
-                logging.debug(f"esptool stdout: {stdout}")
-                logging.debug(f"esptool stderr: {stderr}")
+                output_str = real_time_out.getvalue()
+                
+                # Восстанавливаем вывод
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
 
-                if success and "Hash of data verified" in stdout:
-                    for line in stdout.splitlines():
-                        if '(' in line and '%' in line:
-                            percent = line.strip().split('(')[-1].split(' ')[0]
-                            if percent.isdigit():
-                                percent_label['text'] = f"{percent}%"
-                                progress_bar['value'] = int(percent)
-                                self.window.update_idletasks()
+                if success and "Hash of data verified" in output_str:
+                    self.window.after(0, lambda: progress_bar.configure(value=100))
+                    self.window.after(0, lambda: percent_label.configure(text="100%"))
                     messagebox.showinfo("Успех", "Прошивка завершена успешно!")
-                    logging.debug("Прошивка успешно завершена")
                 else:
-                    logging.error(f"Ошибка прошивки:\nstdout: {stdout}\nstderr: {stderr}")
                     messagebox.showerror("Ошибка", f"Прошивка завершилась с ошибкой:\n{output_str or 'Нет вывода от esptool'}")
+            
             except Exception as e:
-                logging.error(f"Исключение при прошивке: {str(e)}")
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
                 messagebox.showerror("Ошибка", f"Произошла ошибка: {str(e)}")
             finally:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
                 if os.path.exists(temp_firmware_path):
-                    try:
-                        os.remove(temp_firmware_path)
-                        logging.debug(f"Временный файл удален: {temp_firmware_path}")
-                    except Exception as e:
-                        logging.error(f"Ошибка удаления временного файла: {str(e)}")
+                    os.remove(temp_firmware_path)
 
         threading.Thread(target=flash, daemon=True).start()
 
@@ -283,38 +311,15 @@ class TemperatureSensorConfigurator:
                 base_path = sys._MEIPASS
             else:
                 base_path = os.path.dirname(os.path.abspath(__file__))
-
             firmware_path = os.path.join(base_path, firmware_name)
-            logging.debug(f"Проверяется путь к прошивке: {firmware_path}")
-
-            if not os.path.exists(firmware_path):
-                logging.error(f"Файл прошивки не найден: {firmware_path}")
-                return None
-            if not os.access(firmware_path, os.R_OK):
-                logging.error(f"Файл прошивки недоступен для чтения: {firmware_path}")
-                return None
-
-            logging.debug(f"Файл прошивки найден: {firmware_path}")
+            if not os.path.exists(firmware_path): return None
             return firmware_path
-        except Exception as e:
-            logging.error(f"Ошибка в get_firmware_path: {str(e)}")
+        except Exception:
             return None
 
     def select_firmware_file(self, path_var):
-        file_path = filedialog.askopenfilename(
-            title="Выберите файл прошивки",
-            filetypes=(("Bin файлы", "*.bin"), ("Все файлы", "*.*"))
-        )
+        file_path = filedialog.askopenfilename(filetypes=(("Bin файлы", "*.bin"), ("Все файлы", "*.*")))
         if file_path:
-            logging.debug(f"Выбран файл прошивки: {file_path}")
-            if not os.path.exists(file_path):
-                logging.error(f"Выбранный файл не существует: {file_path}")
-                messagebox.showerror("Ошибка", f"Выбранный файл не найден: {file_path}")
-                return
-            if not os.access(file_path, os.R_OK):
-                logging.error(f"Выбранный файл недоступен для чтения: {file_path}")
-                messagebox.showerror("Ошибка", f"Выбранный файл недоступен: {file_path}")
-                return
             path_var.set(file_path)
 
     def create_context_menu(self):
@@ -328,28 +333,17 @@ class TemperatureSensorConfigurator:
     def copy_text(self, event=None):
         try:
             self.response_text.clipboard_clear()
-            selected_text = self.response_text.selection_get()
-            self.response_text.clipboard_append(selected_text)
-        except tk.TclError:
-            pass
+            self.response_text.clipboard_append(self.response_text.selection_get())
+        except tk.TclError: pass
 
     def load_image(self, path, size):
         try:
-            original_image = Image.open(path)
-            resized_image = original_image.resize(size)
-            return ImageTk.PhotoImage(resized_image)
-        except Exception as e:
-            logging.error(f"Ошибка загрузки изображения {path}: {str(e)}")
-            return None
+            return ImageTk.PhotoImage(Image.open(path).resize(size))
+        except Exception: return None
 
     def refresh_ports(self):
-        try:
-            self.ports = serial.tools.list_ports.comports()
-            port_names = [port.device for port in self.ports]
-            self.port_combobox['values'] = port_names
-            logging.debug(f"Обновлен список портов: {port_names}")
-        except Exception as e:
-            logging.error(f"Ошибка при обновлении портов: {str(e)}")
+        self.ports = serial.tools.list_ports.comports()
+        self.port_combobox['values'] = [port.device for port in self.ports]
 
     def connect_device(self):
         selected_port = self.port_combobox.get()
@@ -358,10 +352,8 @@ class TemperatureSensorConfigurator:
                 self.serial_connection = serial.Serial(selected_port, 9600, timeout=0.1)
                 self.response_text.insert(tk.END, f"Подключено к {selected_port}\n")
                 self.window.after(100, self.read_serial_data)
-                logging.debug(f"Подключено к порту: {selected_port}")
             except Exception as e:
                 self.response_text.insert(tk.END, f"Ошибка подключения: {str(e)}\n")
-                logging.error(f"Ошибка подключения к порту {selected_port}: {str(e)}")
 
     def send_command(self, command, value):
         if not value:
@@ -371,98 +363,67 @@ class TemperatureSensorConfigurator:
         if self.serial_connection and self.serial_connection.is_open:
             self.serial_connection.write(full_command.encode('utf-8'))
             self.response_text.insert(tk.END, f"Отправлена команда: {full_command.strip()}\n")
-            logging.debug(f"Отправлена команда: {full_command.strip()}")
         else:
             self.response_text.insert(tk.END, "Не подключено ни одно устройство\n")
-            logging.warning(f"Попытка отправки {command} без подключения")
 
     def set_device_id(self, device_id):
-        device_id = device_id.strip()
-        if device_id.isdigit():
-            self.send_command("setdeviceid", device_id)
-        else:
-            messagebox.showerror("Ошибка", "Неправильный формат Device ID. Введите число.")
-            logging.error("Неправильный формат Device ID")
+        if device_id.strip().isdigit(): self.send_command("setdeviceid", device_id.strip())
+        else: messagebox.showerror("Ошибка", "Неправильный формат Device ID. Введите число.")
 
-    def set_client_id(self, client_id):
-        self.send_command("setclientid", client_id.strip())
-
-    def set_ssid(self, ssid):
-        self.send_command("setssid", ssid.strip())
-
-    def set_password(self, password):
-        self.send_command("setpassword", password.strip())
+    def set_client_id(self, client_id): self.send_command("setclientid", client_id.strip())
+    def set_ssid(self, ssid): self.send_command("setssid", ssid.strip())
+    def set_password(self, password): self.send_command("setpassword", password.strip())
 
     def set_ble_mac(self, ble_mac):
         ble_mac = ble_mac.strip()
-        if ble_mac and len(ble_mac) == 17 and ':' in ble_mac:
-            self.send_command("setblemac", ble_mac)
-        else:
-            messagebox.showerror("Ошибка", "Введите корректный MAC адрес (формат: AA:BB:CC:DD:EE:FF)")
-            logging.error("Некорректный формат MAC адреса")
+        if ble_mac and len(ble_mac) == 17 and ':' in ble_mac: self.send_command("setblemac", ble_mac)
+        else: messagebox.showerror("Ошибка", "Введите корректный MAC адрес (формат: AA:BB:CC:DD:EE:FF)")
 
     def set_url(self, url):
         url = url.strip()
-        if url and url.startswith("http://"):
-            self.send_command("seturl", url)
-        else:
-            messagebox.showerror("Ошибка", "Введите корректный URL (например, http://80.80.101.123:503/data).")
-            logging.error("Некорректный формат URL")
+        if url and url.startswith("http://"): self.send_command("seturl", url)
+        else: messagebox.showerror("Ошибка", "Введите корректный URL (например, http://80.80.101.123:503/data).")
 
     def get_settings(self):
         if self.serial_connection and self.serial_connection.is_open:
-            command = "getsettings\n"
-            self.serial_connection.write(command.encode('utf-8'))
-            self.response_text.insert(tk.END, "Запрос настроек датчика температуры отправлен.\n")
-            logging.debug("Отправлен запрос getsettings")
+            self.serial_connection.write("getsettings\n".encode('utf-8'))
+            self.response_text.insert(tk.END, "Запрос настроек отправлен.\n")
         else:
             self.response_text.insert(tk.END, "Не подключено ни одно устройство\n")
-            logging.warning("Попытка отправки getsettings без подключения")
 
     def read_serial_data(self):
         if self.serial_connection and self.serial_connection.is_open and self.reading_enabled:
             try:
                 if self.serial_connection.in_waiting > 0:
-                    response = self.serial_connection.read(self.serial_connection.in_waiting).decode('utf-8',
-                                                                                                     errors='ignore').strip()
+                    response = self.serial_connection.read(self.serial_connection.in_waiting).decode('utf-8', errors='ignore').strip()
                     if response:
                         self.response_text.insert(tk.END, f"Получено: {response}\n")
                         self.response_text.see(tk.END)
-                        logging.debug(f"Получено из serial: {response}")
                 self.window.after(50, self.read_serial_data)
             except Exception as e:
                 self.response_text.insert(tk.END, f"Ошибка чтения: {str(e)}\n")
-                logging.error(f"Ошибка чтения из serial: {str(e)}")
-                if self.serial_connection.is_open:
-                    self.serial_connection.close()
+                if self.serial_connection.is_open: self.serial_connection.close()
                 self.serial_connection = None
 
     def toggle_diagnostics(self):
         if self.serial_connection and self.serial_connection.is_open:
             if self.diagnostics_var.get():
                 self.reading_enabled = True
-                self.response_text.insert(tk.END, "Диагностика включена. Монитор порта активен.\n")
-                logging.debug("Диагностика включена")
+                self.response_text.insert(tk.END, "Диагностика включена.\n")
                 self.window.after(100, self.read_serial_data)
             else:
                 self.reading_enabled = False
-                self.response_text.insert(tk.END, "Диагностика выключена. Монитор порта остановлен.\n")
-                logging.debug("Диагностика выключена")
+                self.response_text.insert(tk.END, "Диагностика выключена.\n")
         else:
             self.response_text.insert(tk.END, "Не подключено ни одно устройство\n")
-            logging.warning("Попытка переключения диагностики без подключения")
 
     def show_tooltip(self, event, text):
         try:
             self.tooltip_window = tk.Toplevel(self.window)
             self.tooltip_window.wm_overrideredirect(True)
-            x, y = event.x_root + 10, event.y_root + 10
-            self.tooltip_window.wm_geometry(f"+{x}+{y}")
-            tooltip_label = tk.Label(self.tooltip_window, text=text, background="yellow", relief="solid", borderwidth=1,
-                                     padx=5, pady=3, font=("Arial", 10, "bold"), justify='left')
-            tooltip_label.pack()
-        except Exception as e:
-            logging.error(f"Ошибка отображения tooltip: {str(e)}")
+            self.tooltip_window.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+            tk.Label(self.tooltip_window, text=text, background="yellow", relief="solid", borderwidth=1, padx=5, pady=3, font=("Arial", 10, "bold"), justify='left').pack()
+        except Exception: pass
 
     def hide_tooltip(self, event):
         if self.tooltip_window:
